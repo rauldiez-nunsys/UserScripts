@@ -2,6 +2,7 @@
 // @name         SharePoint Tools
 // @namespace    http://tampermonkey.net/
 // @version      1.0
+// @author       raul.diez@nunsys.com
 // @description  Tools for exporting SharePoint lists/libraries and site metadata to JSON
 // @match        https://*.sharepoint.com/sites/*/*
 // @grant        GM_setClipboard
@@ -105,9 +106,9 @@
   /** Menu action configuration (enabled/disabled depending on page). */
   const MENU_ACTIONS = {
     list: {
-      label: "Copy list",
+      label: "Copy data",
       helper: "Metadata + samples to clipboard",
-      title: "Copy active list metadata (Alt+C)",
+      title: "Copy structure and visible data (Alt+C)",
       icon: `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"
                fill="none" stroke="currentColor" stroke-width="2"
                stroke-linecap="round" stroke-linejoin="round">
@@ -118,7 +119,7 @@
     "site-contents": {
       label: "Export site",
       helper: "Full site structure as JSON",
-      title: "Export site structure (Alt+C)",
+      title: "Export full site structure (Alt+C)",
       icon: `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"
                fill="none" stroke="currentColor" stroke-width="2"
                stroke-linecap="round" stroke-linejoin="round">
@@ -134,21 +135,31 @@
   // ---------------------------------------------------------------------------
 
   /**
-   * Sends a GET request to the SharePoint REST API and returns parsed JSON.
-   * Uses `odata=nometadata` to reduce response payload and avoid unnecessary
-   * metadata fields.
-   *
-   * @param {string} url - Fully qualified REST endpoint.
+   * Construye URLs para la API REST de SharePoint.
+   */
+  const apiUrl = {
+    list: (siteUrl, listTitle) =>
+      `${siteUrl}/_api/web/lists/getbytitle('${encodeURIComponent(listTitle)}')`,
+    listById: (siteUrl, listId) => `${siteUrl}/_api/web/lists(guid'${listId}')`,
+    fields: (baseUrl, includeSelect = true) => {
+      const select = includeSelect
+        ? "?$filter=Hidden eq false&$select=Id,Title,InternalName,TypeAsString,TypeDisplayName,Required,ReadOnlyField,Indexed,EnforceUniqueValues,DefaultValue,Description,Choices,FillInChoice,LookupList,LookupField,AllowMultipleValues,MaxLength,Group"
+        : "?$filter=Hidden eq false";
+      return `${baseUrl}/fields${select}`;
+    },
+  };
+
+  /**
+   * Envía una petición GET a la API REST de SharePoint.
+   * @param {string} url - Endpoint REST completo.
    * @returns {Promise<object>}
    */
   const apiFetch = (url) =>
     fetch(url, { headers: { Accept: "application/json;odata=nometadata" } }).then((r) => r.json());
 
   /**
-   * Returns a cleaned copy of a list item, removing system metadata keys and
-   * lookup shadow keys that do not belong to business data.
-   *
-   * @param {object} record - Raw item from the SP REST response.
+   * Cleans a record by removing system metadata keys.
+   * @param {object} record - Item from SP REST response.
    * @returns {object}
    */
   const cleanItem = (record) =>
@@ -161,6 +172,52 @@
           !k.includes("MediaService"),
       ),
     );
+
+  /**
+   * Filters fields to exclude SharePoint internal fields.
+   * @param {Array} fields - Array of fields from the API.
+   * @returns {Array}
+   */
+  const filterBusinessFields = (fields) =>
+    fields.filter((f) => !SKIP_INTERNAL.has(f.InternalName) && f.Group !== "_Hidden");
+
+  /**
+   * Maps fields to standard column format.
+   * @param {object} field - Field from the REST API.
+   * @param {object} [lookupMeta={}] - Optional lookup metadata.
+   * @returns {object}
+   */
+  const mapFieldToColumn = (field, lookupMeta = {}) => ({
+    displayName: field.Title,
+    internalName: field.InternalName,
+    type: field.TypeAsString,
+    typeDisplay: field.TypeDisplayName,
+    group: field.Group || null,
+    required: field.Required,
+    readOnly: field.ReadOnlyField,
+    indexed: field.Indexed,
+    enforceUniqueValues: field.EnforceUniqueValues,
+    defaultValue: field.DefaultValue || null,
+    description: field.Description || null,
+    ...(field.Choices?.length && {
+      choices: field.Choices,
+      fillInChoice: field.FillInChoice,
+    }),
+    ...(field.LookupList && {
+      lookup: lookupMeta[field.InternalName]
+        ? {
+            ...lookupMeta[field.InternalName],
+            field: field.LookupField,
+            multiValue: field.AllowMultipleValues,
+          }
+        : {
+            listId: field.LookupList,
+            field: field.LookupField,
+            multiValue: field.AllowMultipleValues,
+          },
+    }),
+    ...(field.MaxLength && { maxLength: field.MaxLength }),
+  });
 
   /**
    * Fetches all items from a list using automatic pagination.
@@ -217,7 +274,7 @@
   function updateProgressToast(toastEl, current, total, listTitle) {
     if (!toastEl) return;
     const percent = Math.round((current / total) * 100);
-    toastEl.innerText = `⏳  Procesando lista ${current}/${total} (${percent}%): ${listTitle}...`;
+    toastEl.innerText = `⏳  Processing list ${current}/${total} (${percent}%): ${listTitle}...`;
   }
 
   /**
@@ -571,34 +628,34 @@
 
   /**
    * Extracts visible item IDs from the SharePoint modern list view DOM.
-   * Supports several row selector patterns and falls back to generic grid/table
-   * scanning when needed.
-   *
    * @returns {Array<number>} Array of item IDs.
    */
   function extractVisibleItemIds() {
-    const ids = [];
+    // Selectors for SharePoint Modern rows in priority order
+    const rowSelectors = [
+      '[role="row"][data-list-index]',
+      '[role="row"][data-automationid^="ListRow-"]',
+      '[role="row"].ms-List-row',
+    ];
 
-    // Try multiple selectors for SharePoint Modern list rows
-    let rowElements = document.querySelectorAll('[role="row"][data-list-index]');
+    let rowElements = [];
 
-    if (rowElements.length === 0) {
-      rowElements = document.querySelectorAll('[role="row"][data-automationid^="ListRow-"]');
+    // Try specific selectors
+    for (const selector of rowSelectors) {
+      rowElements = document.querySelectorAll(selector);
+      if (rowElements.length > 0) break;
     }
 
+    // Fallback: todas las filas excluyendo headers
     if (rowElements.length === 0) {
-      rowElements = document.querySelectorAll('[role="row"].ms-List-row');
-    }
-
-    if (rowElements.length === 0) {
-      // Fallback: get all rows inside a grid/table and filter out header
       const allRows = document.querySelectorAll(
         '[role="grid"] [role="row"], [role="table"] [role="row"]',
       );
-      rowElements = Array.from(allRows).filter((row) => {
-        const hasColumnHeader = row.querySelector('[role="columnheader"]');
-        return !hasColumnHeader && row.querySelector('[role="gridcell"], [role="cell"]');
-      });
+      rowElements = Array.from(allRows).filter(
+        (row) =>
+          !row.querySelector('[role="columnheader"]') &&
+          row.querySelector('[role="gridcell"], [role="cell"]'),
+      );
     }
 
     if (rowElements.length === 0) {
@@ -607,52 +664,38 @@
       );
     }
 
-    // Extract item IDs from each visible row
-    rowElements.forEach((row) => {
-      // Try multiple strategies to get the item ID
-      let itemId = null;
+    // Strategies to extract ID in order of reliability
+    const extractId = (row) => {
+      // 1. Direct data attributes
+      const dataId = row.getAttribute("data-item-id") || row.getAttribute("data-list-item-id");
+      if (dataId) return parseInt(dataId, 10);
 
-      // 1. Check data attributes
-      itemId = row.getAttribute("data-item-id") || row.getAttribute("data-list-item-id");
+      // 2. ID from data-automationid
+      const automationId = row.getAttribute("data-automationid");
+      if (automationId) {
+        const match = automationId.match(/(\d+)$/);
+        if (match) return parseInt(match[1], 10);
+      }
 
-      // 2. Try aria-rowindex (sometimes corresponds to ID + 1 or just index)
-      if (!itemId) {
-        const rowIndex = row.getAttribute("aria-rowindex");
-        if (rowIndex) {
-          // This is often just the visual row number, not the actual ID
-          // We'll use it as fallback but it's not reliable
-          itemId = parseInt(rowIndex, 10);
+      // 3. First numeric cell
+      const cells = row.querySelectorAll('[role="gridcell"], [role="cell"]');
+      if (cells.length > 0) {
+        const cellText = cells[0].textContent?.trim();
+        if (cellText && /^\d+$/.test(cellText)) {
+          return parseInt(cellText, 10);
         }
       }
 
-      // 3. Try to find ID in cell content (first cell often contains ID)
-      if (!itemId) {
-        const cells = row.querySelectorAll('[role="gridcell"], [role="cell"]');
-        if (cells.length > 0) {
-          const firstCell = cells[0];
-          const cellText = firstCell.textContent?.trim();
-          // Check if first cell is numeric (might be ID)
-          if (cellText && /^\d+$/.test(cellText)) {
-            itemId = parseInt(cellText, 10);
-          }
-        }
-      }
+      // 4. aria-rowindex (less reliable)
+      const rowIndex = row.getAttribute("aria-rowindex");
+      if (rowIndex) return parseInt(rowIndex, 10);
 
-      // 4. Try data-automationid which sometimes contains the ID
-      if (!itemId) {
-        const automationId = row.getAttribute("data-automationid");
-        if (automationId) {
-          const match = automationId.match(/(\d+)$/);
-          if (match) {
-            itemId = parseInt(match[1], 10);
-          }
-        }
-      }
+      return null;
+    };
 
-      if (itemId && !isNaN(itemId)) {
-        ids.push(itemId);
-      }
-    });
+    const ids = Array.from(rowElements)
+      .map(extractId)
+      .filter((id) => id && !isNaN(id));
 
     if (ids.length === 0) {
       throw new Error(
@@ -680,7 +723,7 @@
     if (root?.__setBusy) root.__setBusy(true);
     if (root?.__setMenuOpen) root.__setMenuOpen(false);
 
-    const loader = showToast(`Extracting visible item IDs from "${listTitle}"…`, "loading");
+    const loader = showToast(`Extracting visible IDs from "${listTitle}"…`, "loading");
 
     try {
       // Step 1: Extract IDs from visible rows
@@ -688,12 +731,12 @@
 
       transitionToast(
         loader,
-        `Fetching ${visibleIds.length} records + list structure from API…`,
+        `Fetching ${visibleIds.length} records + structure from API…`,
         "loading",
       );
 
       // Step 2: Fetch complete items AND list structure from REST API in parallel
-      const base = `${siteUrl}/_api/web/lists/getbytitle('${encodeURIComponent(listTitle)}')`;
+      const base = apiUrl.list(siteUrl, listTitle);
 
       // Build filter query for visible IDs
       const idFilter = visibleIds.map((id) => `Id eq ${id}`).join(" or ");
@@ -702,12 +745,7 @@
       // Fetch items and fields in parallel
       const [itemsData, fieldsData] = await Promise.all([
         apiFetch(itemsUrl),
-        apiFetch(
-          `${base}/fields?$filter=Hidden eq false` +
-            `&$select=Id,Title,InternalName,TypeAsString,TypeDisplayName,Required,` +
-            `ReadOnlyField,Indexed,EnforceUniqueValues,DefaultValue,Description,` +
-            `Choices,FillInChoice,LookupList,LookupField,AllowMultipleValues,MaxLength,Group`,
-        ),
+        apiFetch(apiUrl.fields(base)),
       ]);
 
       const items = (itemsData.value ?? []).map(cleanItem);
@@ -720,28 +758,7 @@
 
       // Process fields/columns
       const allFields = fieldsData.value ?? [];
-      const columns = allFields
-        .filter((f) => !SKIP_INTERNAL.has(f.InternalName) && f.Group !== "_Hidden")
-        .map((f) => ({
-          displayName: f.Title,
-          internalName: f.InternalName,
-          type: f.TypeAsString,
-          typeDisplay: f.TypeDisplayName,
-          group: f.Group || null,
-          required: f.Required,
-          readOnly: f.ReadOnlyField,
-          indexed: f.Indexed,
-          enforceUniqueValues: f.EnforceUniqueValues,
-          defaultValue: f.DefaultValue || null,
-          description: f.Description || null,
-          ...(f.Choices?.length && { choices: f.Choices, fillInChoice: f.FillInChoice }),
-          ...(f.LookupList && {
-            lookupListId: f.LookupList,
-            lookupField: f.LookupField,
-            allowMultipleValues: f.AllowMultipleValues,
-          }),
-          ...(f.MaxLength && { maxLength: f.MaxLength }),
-        }));
+      const columns = filterBusinessFields(allFields).map((f) => mapFieldToColumn(f));
 
       const payload = {
         _meta: {
@@ -769,10 +786,7 @@
 
       setTimeout(
         () =>
-          showToast(
-            `${sortedItems.length} records + ${columns.length} columns copied to clipboard`,
-            "success",
-          ),
+          showToast(`${sortedItems.length} records + ${columns.length} columns copied`, "success"),
         1300,
       );
     } catch (err) {
@@ -814,7 +828,7 @@
       const stats = result.stats;
       transitionToast(
         loader,
-        `Guardando ${stats.totalItems} registros de ${stats.totalLists} listas…`,
+        `Saving ${stats.totalItems} records from ${stats.totalLists} lists…`,
         "info",
         1500,
       );
@@ -824,7 +838,7 @@
       setTimeout(
         () =>
           showToast(
-            `Exportado: ${stats.totalLists} listas, ${stats.totalFields} campos, ${stats.totalItems} registros`,
+            `Exported: ${stats.totalLists} lists, ${stats.totalFields} fields, ${stats.totalItems} records`,
             "success",
             5000,
           ),
@@ -867,7 +881,7 @@
         throw new Error("No active list found on this page");
       })();
 
-    const base = `${siteUrl}/_api/web/lists/getbytitle('${encodeURIComponent(listTitle)}')`;
+    const base = apiUrl.list(siteUrl, listTitle);
 
     // -- Round 0: get list metadata to determine item count ------------------
     const listData = await apiFetch(
@@ -881,12 +895,7 @@
 
     // -- Round 1: fields, items, content types, views -------------------------
     const [fieldsData, itemsData, ctData, viewsData] = await Promise.all([
-      apiFetch(
-        `${base}/fields?$filter=Hidden eq false` +
-          `&$select=Id,Title,InternalName,TypeAsString,TypeDisplayName,Required,` +
-          `ReadOnlyField,Indexed,EnforceUniqueValues,DefaultValue,Description,` +
-          `Choices,FillInChoice,LookupList,LookupField,AllowMultipleValues,MaxLength,Group`,
-      ),
+      apiFetch(apiUrl.fields(base)),
       apiFetch(`${base}/items?$top=${itemsToFetch}`),
       apiFetch(`${base}/contenttypes?$select=Id,Name,Description,Group,Hidden,Order`),
       apiFetch(`${base}/views?$select=Id,Title,DefaultView,RowLimit,ViewType,Paged,ViewQuery`),
@@ -949,30 +958,7 @@
     }
 
     // -- Shape columns --------------------------------------------------------
-    const columns = allFields
-      .filter((f) => !SKIP_INTERNAL.has(f.InternalName) && f.Group !== "_Hidden")
-      .map((f) => ({
-        displayName: f.Title,
-        internalName: f.InternalName,
-        type: f.TypeAsString,
-        typeDisplay: f.TypeDisplayName,
-        group: f.Group || null,
-        required: f.Required,
-        readOnly: f.ReadOnlyField,
-        indexed: f.Indexed,
-        enforceUniqueValues: f.EnforceUniqueValues,
-        defaultValue: f.DefaultValue || null,
-        description: f.Description || null,
-        ...(f.Choices?.length && { choices: f.Choices, fillInChoice: f.FillInChoice }),
-        ...(f.LookupList && {
-          lookup: {
-            ...lookupMeta[f.InternalName],
-            field: f.LookupField,
-            multiValue: f.AllowMultipleValues,
-          },
-        }),
-        ...(f.MaxLength && { maxLength: f.MaxLength }),
-      }));
+    const columns = filterBusinessFields(allFields).map((f) => mapFieldToColumn(f, lookupMeta));
 
     // -- Overview section: business fields + clean sample records -------------
 
@@ -1037,13 +1023,13 @@
         );
       })
       .filter((rec) => {
-        // Filtrar registros que solo tienen Id o valores por defecto
+        // Filter records that only have Id or default values
         const meaningfulKeys = Object.keys(rec).filter((k) => {
           if (k === "Id") return false;
           const val = rec[k];
-          // Excluir null/undefined
+          // Exclude null/undefined
           if (val == null) return false;
-          // Excluir false (valor por defecto común en Yes/No)
+          // Exclude false (common default value in Yes/No)
           if (val === false) return false;
           return true;
         });
@@ -1102,15 +1088,15 @@
         columns,
         views,
         sampleItems: (itemsData.value ?? []).map(cleanItem).filter((item) => {
-          // Filtrar items que solo tienen metadatos o valores por defecto
+          // Filter items that only have metadata or default values
           const meaningfulKeys = Object.keys(item).filter((k) => {
-            // Excluir metadatos del sistema
+            // Exclude system metadata
             if (["Id", "Created", "Modified", "AuthorId", "EditorId", "CheckoutUserId"].includes(k))
               return false;
             const val = item[k];
-            // Excluir null/undefined
+            // Exclude null/undefined
             if (val == null) return false;
-            // Excluir false (valor por defecto común en Yes/No)
+            // Exclude false (common default value in Yes/No)
             if (val === false) return false;
             return true;
           });
@@ -1162,52 +1148,24 @@
     let totalItemsExtracted = 0;
 
     /**
-     * Normalises a raw SP list entry and fetches its fields and ALL items.
-     *
-     * @param {object} l - Raw list object from the REST response.
+     * Normalizes a raw SP list entry and fetches its fields and ALL items.
+     * @param {object} l - List object from the REST response.
      * @param {number} index - Current index (for progress tracking).
      * @returns {Promise<object>}
      */
     const shapeList = async (l, index) => {
       updateProgressToast(progressToast, index + 1, allLists.length, l.Title);
 
-      const listBase = `${siteUrl}/_api/web/lists(guid'${l.Id}')`;
+      const listBase = apiUrl.listById(siteUrl, l.Id);
       let fields = [];
       let items = [];
       let error = null;
 
       try {
         // Fetch fields for this list
-        const fieldsData = await apiFetch(
-          `${listBase}/fields?$filter=Hidden eq false` +
-            `&$select=Id,Title,InternalName,TypeAsString,TypeDisplayName,Required,` +
-            `ReadOnlyField,Indexed,EnforceUniqueValues,DefaultValue,Description,` +
-            `Choices,FillInChoice,LookupList,LookupField,AllowMultipleValues,MaxLength,Group`,
-        );
-
+        const fieldsData = await apiFetch(apiUrl.fields(listBase));
         const allFields = fieldsData.value ?? [];
-        fields = allFields
-          .filter((f) => !SKIP_INTERNAL.has(f.InternalName) && f.Group !== "_Hidden")
-          .map((f) => ({
-            displayName: f.Title,
-            internalName: f.InternalName,
-            type: f.TypeAsString,
-            typeDisplay: f.TypeDisplayName,
-            group: f.Group || null,
-            required: f.Required,
-            readOnly: f.ReadOnlyField,
-            indexed: f.Indexed,
-            enforceUniqueValues: f.EnforceUniqueValues,
-            defaultValue: f.DefaultValue || null,
-            description: f.Description || null,
-            ...(f.Choices?.length && { choices: f.Choices, fillInChoice: f.FillInChoice }),
-            ...(f.LookupList && {
-              lookupListId: f.LookupList,
-              lookupField: f.LookupField,
-              allowMultipleValues: f.AllowMultipleValues,
-            }),
-            ...(f.MaxLength && { maxLength: f.MaxLength }),
-          }));
+        fields = filterBusinessFields(allFields).map((f) => mapFieldToColumn(f));
 
         totalFieldsExtracted += fields.length;
 
